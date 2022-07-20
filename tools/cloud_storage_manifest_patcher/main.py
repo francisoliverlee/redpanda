@@ -8,6 +8,63 @@ import time
 import datetime
 from typing import Union
 import json
+import struct
+import collections
+import xxhash
+
+HDR_FMT_RP = "<IiqbIhiqqqhii"
+
+HEADER_SIZE = struct.calcsize(HDR_FMT_RP)
+
+Header = collections.namedtuple(
+    'Header', ('header_crc', 'batch_size', 'base_offset', 'type', 'crc',
+               'attrs', 'delta', 'first_ts', 'max_ts', 'producer_id',
+               'producer_epoch', 'base_seq', 'record_count'))
+
+
+class SegmentReader:
+    def __init__(self, stream):
+        self.stream = stream
+
+    def read_batch(self):
+        data = self.stream.read(HEADER_SIZE)
+        if len(data) == HEADER_SIZE:
+            header = Header(*struct.unpack(HDR_FMT_RP, data))
+            if all(map(lambda v: v == 0, header)):
+                return None
+            records_size = header.batch_size - HEADER_SIZE
+            data = self.stream.read(records_size)
+            if len(data) < records_size:
+                return None
+            assert len(data) == records_size
+            return header
+        return None
+
+    def __iter__(self):
+        while True:
+            it = self.read_batch()
+            if it is None:
+                return
+            yield it
+
+
+def get_segment_path(namespace, topic, id, rev, segment_name, term):
+    x = xxhash.xxh32()
+    path = f"{namespace}/{topic}/{id}_{rev}/{segment_name}"
+    x.update(path.encode('ascii'))
+    hash = x.hexdigest()
+    if term is None:
+        return f"{hash}/{path}"
+    else:
+        return f"{hash}/{path}.{term}"
+
+
+def get_partition_manifest_path(topic, revision, part_id):
+    x = xxhash.xxh32()
+    path = f"kafka/{topic}/{part_id}_{revision}"
+    x.update(path.encode('ascii'))
+    manifest_hash = x.hexdigest()[0] + '0000000'
+    return f"{manifest_hash}/meta/{path}/manifest.json"
 
 
 class SlowDown(Exception):
@@ -225,6 +282,10 @@ class S3Client:
         resp = self._get_object(bucket, key)
         return resp['Body'].read()
 
+    def get_object_data_stream(self, bucket, key):
+        resp = self._get_object(bucket, key)
+        return resp['Body']
+
     def put_object(self, bucket, key, data):
         self._put_object(bucket, key, data)
 
@@ -309,6 +370,72 @@ class S3Client:
             raise
 
 
+class ManifestIterator:
+    def __init__(self, obj):
+        self.data = obj
+        self.namespace = obj['namespace']
+        self.topic = obj['topic']
+        self.partition = obj['partition']
+        self.revision = obj['revision']
+        segments = []
+        for key, value in obj['segments'].items():
+            segments.append(
+                (key, value.get('archiver_term'), value.get('ntp_revision')))
+        self.segments = sorted(segments, key=lambda x: int(x[0].split('-')[0]))
+
+    def list_segments(self):
+        for key, term, rev in self.segments:
+            yield key, get_segment_path(self.namespace, self.topic,
+                                        self.partition, rev or self.revision,
+                                        key, term)
+
+
+def get_segment_meta(s3client: S3Client, bucket, path):
+    print(f"Downloading segment {path} from {bucket}")
+    stream = s3client.get_object_data_stream(bucket, path)
+    # 'Header', ('header_crc', 'batch_size', 'base_offset', 'type', 'crc',
+    #            'attrs', 'delta', 'first_ts', 'max_ts', 'producer_id',
+    #            'producer_epoch', 'base_seq', 'record_count'))
+    rdr = SegmentReader(stream)
+    total_size = 0
+    num_configs = 0
+    base_offset = None
+    base_timestamp = None
+    max_timestamp = -1
+    last_offset = 0
+    for batch in rdr:
+        if batch is None:
+            break
+        if batch.type != 1:
+            num_configs += 1
+        max_timestamp = max(max_timestamp, batch.max_ts)
+        base_timestamp = base_timestamp or batch.first_ts
+        base_offset = base_offset or batch.base_offset
+        total_size += batch.batch_size
+        last_offset = max(last_offset, batch.base_offset + batch.record_count)
+
+    return base_offset, base_timestamp, last_offset, max_timestamp, num_configs, total_size
+
+
+def parse_segment_name(sname):
+    # hash/ns/tn/pid_rev/boff-term-v1.log(.term)
+    components = sname.split('/')
+    ns = components[1]
+    tn = components[2]
+    pid, rev = components[3].split('_')
+    boff, term, tail = components[4].split('-')
+    if tail.endswith('.log'):
+        # old-style name
+        return ns, tn, int(pid), int(rev), int(boff), int(term), None
+    else:
+        _, _, aterm = tail.split('.')
+        return ns, tn, int(pid), int(rev), int(boff), int(term), int(aterm)
+
+
+def make_segment_name(offset, term):
+    return f"{offset}-{term}-v1.log"
+
+
 def main():
     import argparse
     import logging
@@ -316,39 +443,30 @@ def main():
     logger = logging.getLogger("main")
 
     def generate_options():
-        parser = argparse.ArgumentParser(
-            description='List remote partitions')
+        parser = argparse.ArgumentParser(description='List remote partitions')
 
         parser.add_argument('op',
                             type=str,
                             help='operation to perform on a bucket')
-        parser.add_argument('region',
-                            type=str,
-                            help='name of the AWS region')
-        parser.add_argument('bucket',
-                            type=str,
-                            help='bucket name')
-        parser.add_argument('access_key',
-                            type=str,
-                            help='access key')
-        parser.add_argument('secret_key',
-                            type=str,
-                            help='secret key')
-        parser.add_argument('endpoint',
-                            type=str,
-                            help='endpoint')
+        parser.add_argument('region', type=str, help='name of the AWS region')
+        parser.add_argument('bucket', type=str, help='bucket name')
+        parser.add_argument('access_key', type=str, help='access key')
+        parser.add_argument('secret_key', type=str, help='secret key')
+        parser.add_argument('endpoint', type=str, help='endpoint')
         return parser
 
     parser = generate_options()
     options, _ = parser.parse_known_args()
 
-    client = S3Client(options.region, options.access_key, options.secret_key, logger, options.endpoint)
+    client = S3Client(options.region, options.access_key, options.secret_key,
+                      logger, options.endpoint)
 
     topic_manifests = []
     partition_manifests = []
     segments_size = 0
     segments_num = 0
     num_objects = 0
+    segments = []
     for meta in client.list_objects(options.bucket):
         num_objects += 1
         # Collect only topic manifests
@@ -357,11 +475,15 @@ def main():
         elif meta.Key.endswith("/manifest.json"):
             partition_manifests.append(meta.Key)
         else:
+            print(f"segment {meta.Key}")
             segments_size += int(meta.ContentLength)
             segments_num += 1
+            segments.append(meta.Key)
 
-    print(f"Scanned the bucket, {num_objects} objects scanned, {segments_size} bytes in {segments_num} segments, {len(topic_manifests)} topics found, {len(partition_manifests)} partitions found")
-    
+    print(
+        f"Scanned the bucket, {num_objects} objects scanned, {segments_size} bytes in {segments_num} segments, {len(topic_manifests)} topics found, {len(partition_manifests)} partitions found"
+    )
+
     if options.op == "gencmd":
         # Download topic manifests
         recovery_commands = []
@@ -376,18 +498,73 @@ def main():
             print(cmd_all)
         print("\nDone")
     elif options.op == "patch":
-        # Patch partition manifests
-        for pm in partition_manifests:
-            data = client.get_object_data(options.bucket, pm)
-            pmobj = json.loads(data)
-            upload = False
-            for _, meta in pmobj['segments'].items():
-                if 'delta_offset' not in meta:
-                    meta['delta_offset'] = 0
-                    upload = True
-            if upload:
-                print(f"Writing patched manifest to {pm}")
-                client.put_object(options.bucket, pm, json.dumps(pmobj))
+        # Go through the segments and re-create all manifests from the ground up
+        for tm in topic_manifests:
+            data = client.get_object_data(options.bucket, tm)
+            tmobj = json.loads(data)
+            ns = tmobj['namespace']
+            if ns != 'kafka':
+                continue
+            revision = int(tmobj['revision_id'])
+            topic = tmobj['topic']
+            partition_count = int(tmobj['partition_count'])
+
+            # For every partition in a topic we need to find all segments
+            # that belonged to it. Next we need to download them and analyze
+            # so we could recreate the partitions.
+            for part_id in range(0, partition_count):
+                partition_segments = []
+                for segment_name in segments:
+                    ns, tn, pid, rev, boff, term, aterm = parse_segment_name(
+                        segment_name)
+                    if topic == tn and part_id == pid:
+                        partition_segments.append(
+                            (rev, boff, term, aterm, segment_name))
+
+                partition_manifest = {
+                    "version": 1,
+                    "namespace": "kafka",
+                    "topic": topic,
+                    "partition": part_id,
+                    "revision": revision,
+                    "last_offset": 0,  # TODO: update
+                    "segments": {}
+                }
+
+                partition_segments = sorted(partition_segments)
+                delta_offset = 0
+                last_uploaded_offset = 0
+                for rev, base_offset, term, aterm, path in partition_segments:
+                    base_offset, base_timestamp, last_offset, max_timestamp, num_configs, size_bytes = get_segment_meta(
+                        client, options.bucket, path)
+                    name = make_segment_name(base_offset, term)
+                    partition_manifest['segments'][name] = {
+                        "is_compacted": False,
+                        "size_bytes": size_bytes,
+                        "committed_offset": last_offset,
+                        "base_offset": base_offset,
+                        "base_timestamp": base_timestamp,
+                        "max_timestamp": max_timestamp,
+                        "delta_offset": delta_offset,
+                        "ntp_revision":
+                        rev,  # this is a revision from segment name
+                    }
+                    if aterm is not None:
+                        partition_manifest['segments'][name][
+                            'archiver_term'] = aterm
+                    delta_offset += num_configs
+                    last_uploaded_offset = last_offset
+
+                partition_manifest['last_offset'] = last_uploaded_offset
+                manifest_key = get_partition_manifest_path(
+                    topic, revision, part_id)
+                print(
+                    f"Generated manifest for {topic} {part_id}, path: {manifest_key}"
+                )
+                print(f"Content: {json.dumps(partition_manifest)}")
+                client.put_object(options.bucket, manifest_key,
+                                  json.dumps(partition_manifest))
+
 
 if __name__ == '__main__':
     main()
