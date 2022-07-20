@@ -543,7 +543,7 @@ partition_downloader::find_recovery_material(const remote_manifest_path& key) {
     if (result != download_result::success) {
         throw missing_partition_exception(key);
     }
-    auto orig_rev = recovery_mat.topic_manifest.get_revision();
+    auto orig_rev = recovery_mat.topic_manifest.get_prev_revision();
     partition_manifest tmp(_ntpc.ntp(), orig_rev);
     auto res = co_await _remote->download_manifest(
       _bucket, tmp.get_manifest_path(), tmp, _rtcnode);
