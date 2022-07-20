@@ -69,6 +69,24 @@ static constexpr std::string_view full_topic_manifest_json = R"json({
     "retention_duration": 36000000000
 })json";
 
+static constexpr std::string_view topic_manifest_json_with_prev_revision
+  = R"json({
+    "version": 1,
+    "namespace": "full-test-namespace",
+    "topic": "full-test-topic",
+    "partition_count": 64,
+    "replication_factor": 6,
+    "revision_id": 1,
+    "prev_revision_id": 10,
+    "compression": "snappy",
+    "cleanup_policy_bitflags": "compact,delete",
+    "compaction_strategy": "offset",
+    "timestamp_type": "LogAppendTime",
+    "segment_size": 1234,
+    "retention_bytes": 42342,
+    "retention_duration": 36000000000
+})json";
+
 static constexpr std::string_view missing_partition_count = R"json({
     "version": 1,
     "namespace": "test-namespace",
@@ -198,6 +216,40 @@ SEASTAR_THREAD_TEST_CASE(full_config_update_all_fields_correct) {
 
     auto topic_config = m.get_topic_config().value();
     BOOST_REQUIRE_EQUAL(m.get_revision(), model::initial_revision_id(1));
+    BOOST_REQUIRE_EQUAL(m.get_prev_revision(), model::initial_revision_id(1));
+    BOOST_REQUIRE_EQUAL(
+      topic_config.tp_ns,
+      model::topic_namespace(
+        model::ns("full-test-namespace"), model::topic("full-test-topic")));
+    BOOST_REQUIRE_EQUAL(topic_config.partition_count, 64);
+    BOOST_REQUIRE_EQUAL(topic_config.replication_factor, 6);
+    BOOST_REQUIRE_EQUAL(
+      topic_config.properties.compression.value(), model::compression::snappy);
+    BOOST_REQUIRE_EQUAL(
+      topic_config.properties.cleanup_policy_bitflags.value(),
+      model::cleanup_policy_bitflags::deletion
+        | model::cleanup_policy_bitflags::compaction);
+    BOOST_REQUIRE_EQUAL(
+      topic_config.properties.compaction_strategy.value(),
+      model::compaction_strategy::offset);
+    BOOST_REQUIRE_EQUAL(
+      topic_config.properties.timestamp_type.value(),
+      model::timestamp_type::append_time);
+    BOOST_REQUIRE_EQUAL(topic_config.properties.segment_size.value(), 1234);
+    BOOST_REQUIRE_EQUAL(topic_config.properties.retention_bytes.value(), 42342);
+    BOOST_REQUIRE_EQUAL(
+      topic_config.properties.retention_duration.value(),
+      std::chrono::milliseconds(36000000000));
+}
+
+SEASTAR_THREAD_TEST_CASE(config_with_prev_revision_update_all_fields_correct) {
+    topic_manifest m;
+    m.update(make_manifest_stream(topic_manifest_json_with_prev_revision))
+      .get();
+
+    auto topic_config = m.get_topic_config().value();
+    BOOST_REQUIRE_EQUAL(m.get_revision(), model::initial_revision_id(1));
+    BOOST_REQUIRE_EQUAL(m.get_prev_revision(), model::initial_revision_id(10));
     BOOST_REQUIRE_EQUAL(
       topic_config.tp_ns,
       model::topic_namespace(

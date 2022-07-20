@@ -13,6 +13,7 @@
 #include "cloud_storage/base_manifest.h"
 #include "cluster/types.h"
 #include "json/document.h"
+#include "model/metadata.h"
 
 #include <optional>
 
@@ -53,8 +54,22 @@ public:
 
     model::initial_revision_id get_revision() const noexcept { return _rev; }
 
+    /// Return previous revision id.
+    /// If the topic manifest was used for topic recovery the revision id might
+    /// be different and recovery process need a way to access previous revision
+    /// id.
+    model::initial_revision_id get_prev_revision() const noexcept {
+        if (_prev_rev == model::initial_revision_id::min()) {
+            return _rev;
+        }
+        return _prev_rev;
+    }
+
     /// Change topic-manifest revision
-    void set_revision(model::initial_revision_id id) noexcept { _rev = id; }
+    void set_revision(model::initial_revision_id id) noexcept {
+        _prev_rev = _rev;
+        _rev = id;
+    }
 
     std::optional<cluster::topic_configuration> const&
     get_topic_config() const noexcept {
@@ -67,6 +82,12 @@ private:
     void update(const topic_manifest_handler& handler);
 
     std::optional<cluster::topic_configuration> _topic_config;
+    /// Initial revision of the topic
     model::initial_revision_id _rev;
+    /// Initial revision of the topic before recovery.
+    /// Topic manifest need to be re-uploaded after successful recovery of the
+    /// partition 0. In this case we want to know old revision id to recover
+    /// other partitions successfuly.
+    model::initial_revision_id _prev_rev{model::initial_revision_id::min()};
 };
 } // namespace cloud_storage

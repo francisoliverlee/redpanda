@@ -24,6 +24,7 @@
 #include "json/writer.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 #include "model/timestamp.h"
 
 #include <seastar/core/coroutine.hh>
@@ -106,6 +107,8 @@ struct topic_manifest_handler
                 _replication_factor = u;
             } else if ("revision_id" == _key) {
                 _revision_id = model::initial_revision_id(u);
+            } else if ("prev_revision_id" == _key) {
+                _prev_revision_id = model::initial_revision_id(u);
             } else if ("segment_size" == _key) {
                 _properties.segment_size = u;
             } else if ("retention_bytes" == _key) {
@@ -154,6 +157,7 @@ struct topic_manifest_handler
     std::optional<int32_t> _partition_count;
     std::optional<int16_t> _replication_factor;
     std::optional<model::initial_revision_id> _revision_id{};
+    std::optional<model::initial_revision_id> _prev_revision_id{};
 
     // optional fields
     cluster::topic_properties _properties;
@@ -179,6 +183,8 @@ void topic_manifest::update(const topic_manifest_handler& handler) {
           handler._version));
     }
     _rev = handler._revision_id.value();
+    _prev_rev = handler._prev_revision_id.value_or(
+      model::initial_revision_id::min());
 
     if (!handler._version) {
         throw std::runtime_error(fmt_with_ctx(
@@ -334,6 +340,10 @@ void topic_manifest::serialize(std::ostream& out) const {
     w.Int(_topic_config->replication_factor);
     w.Key("revision_id");
     w.Int(_rev());
+    if (_prev_rev != model::initial_revision_id::min()) {
+        w.Key("prev_revision_id");
+        w.Int(_prev_rev());
+    }
 
     // optional values are encoded in the following manner:
     // - key set to null - optional is nullopt
